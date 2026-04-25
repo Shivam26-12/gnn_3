@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+
+# Data
+data/processed/
+data/raw/
+*.csv
+
+# Environment variables
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+CLAUDE.md
+.claude
+instructions/
+results/*.pt
+results/*.pkl
