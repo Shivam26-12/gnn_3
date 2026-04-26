@@ -23,7 +23,7 @@ def _collect_and_eval(model: torch.nn.Module, loader: DataLoader, device: torch.
     for batch in loader:
         batch = batch.to(device)
         ea = getattr(batch, "edge_attr", None)
-        preds.append(model(batch.x, batch.edge_index, ea).cpu())
+        preds.append(model(batch.x_seq, batch.x_static, batch.edge_index, ea).cpu())
         targets.append(batch.y.cpu())
         
     y_pred = torch.cat(preds)
@@ -40,13 +40,14 @@ def run_evaluation(test_loader: DataLoader, G=None, device: torch.device = None)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
     sample = next(iter(test_loader))
-    in_channels = sample.x.shape[1]
+    seq_channels = sample.x_seq.shape[2]
+    static_channels = sample.x_static.shape[1]
     horizon = sample.y.shape[1]
     
-    gnn = DTNetGNN(in_channels=in_channels, forecast_horizon=horizon).to(device)
+    gnn = DTNetGNN(seq_channels=seq_channels, static_channels=static_channels, forecast_horizon=horizon).to(device)
     gnn.load_state_dict(torch.load(GNN_SAVE_PATH, map_location=device, weights_only=True))
     
-    baseline = IsolatedBaseline(in_channels=in_channels, forecast_horizon=horizon).to(device)
+    baseline = IsolatedBaseline(seq_channels=seq_channels, static_channels=static_channels, forecast_horizon=horizon).to(device)
     baseline.load_state_dict(torch.load(BASELINE_SAVE_PATH, map_location=device, weights_only=True))
     
     gnn_test = _collect_and_eval(gnn, test_loader, device)

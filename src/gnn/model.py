@@ -25,21 +25,29 @@ HORIZON: int = 28
 
 
 class DTNetGNN(nn.Module):
-    """3-layer GAT with residual connections for demand forecasting.
+    """Spatio-Temporal Graph Neural Network (GRU + GAT).
 
     Architecture:
-        GATConv(25 -> 256, heads=8)  -> 2048-dim + residual projection
+        GRU(15 -> 64) -> Temporal Embedding
+        Concat(Temporal Embedding, Static Features) -> 74-dim Node Feature
+        GATConv(74 -> 256, heads=8)  -> 2048-dim + residual projection
         GATConv(2048 -> 256, heads=4) -> 1024-dim + residual
         GATConv(1024 -> 256, heads=4) -> 1024-dim + residual
         Linear(1024 -> 512) -> ReLU -> Dropout
         Linear(512 -> 256) -> ReLU
         Linear(256 -> 28) -> Softplus (non-negative sales)
     """
-    def __init__(self, in_channels=IN_CHANNELS, hidden=HIDDEN, edge_dim=EDGE_DIM,
+    def __init__(self, seq_channels=21, static_channels=10, gru_hidden=64,
+                 hidden=HIDDEN, edge_dim=EDGE_DIM,
                  heads_1=HEADS_1, heads_2=HEADS_2, heads_3=HEADS_3,
                  dropout=DROPOUT, forecast_horizon=HORIZON):
         super().__init__()
         self.dropout = dropout
+
+        # Temporal module
+        self.temporal = nn.GRU(input_size=seq_channels, hidden_size=gru_hidden, batch_first=True)
+        
+        in_channels = gru_hidden + static_channels
 
         self.conv1 = GATConv(in_channels, hidden, heads=heads_1, edge_dim=edge_dim, concat=True)
         self.bn1 = nn.BatchNorm1d(hidden * heads_1)
@@ -61,8 +69,17 @@ class DTNetGNN(nn.Module):
         self.fc3 = nn.Linear(hidden, forecast_horizon)
         self.softplus = nn.Softplus()
 
-    def forward(self, x, edge_index, edge_attr=None):
-        # Layer 1
+    def forward(self, x_seq, x_static, edge_index, edge_attr=None):
+        # Temporal Pass
+        # x_seq: (N, seq_len, 15)
+        out, h_n = self.temporal(x_seq)
+        # We take the final hidden state from the GRU: (1, N, gru_hidden) -> (N, gru_hidden)
+        t_embed = h_n.squeeze(0)
+        
+        # Combine with static features
+        x = torch.cat([t_embed, x_static], dim=1) # (N, gru_hidden + static_channels)
+
+        # Graph Pass Layer 1
         res = self.res1(x)
         x = self.conv1(x, edge_index, edge_attr=edge_attr)
         x = self.bn1(x)
@@ -92,9 +109,13 @@ class DTNetGNN(nn.Module):
 
 
 class IsolatedBaseline(nn.Module):
-    """4-layer MLP baseline (no graph structure)."""
-    def __init__(self, in_channels=IN_CHANNELS, hidden=HIDDEN, forecast_horizon=HORIZON):
+    """Baseline MLP with Temporal GRU (no graph structure)."""
+    def __init__(self, seq_channels=21, static_channels=10, gru_hidden=64, 
+                 hidden=HIDDEN, forecast_horizon=HORIZON):
         super().__init__()
+        self.temporal = nn.GRU(input_size=seq_channels, hidden_size=gru_hidden, batch_first=True)
+        in_channels = gru_hidden + static_channels
+        
         self.net = nn.Sequential(
             nn.Linear(in_channels, hidden * 2),
             nn.BatchNorm1d(hidden * 2),
@@ -110,5 +131,8 @@ class IsolatedBaseline(nn.Module):
             nn.Softplus(),
         )
 
-    def forward(self, x, edge_index=None, edge_attr=None):
+    def forward(self, x_seq, x_static, edge_index=None, edge_attr=None):
+        out, h_n = self.temporal(x_seq)
+        t_embed = h_n.squeeze(0)
+        x = torch.cat([t_embed, x_static], dim=1)
         return self.net(x)  # (N, 28)

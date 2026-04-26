@@ -61,7 +61,7 @@ def step2_build_dataset(dfs, G=None):
         calendar_df=dfs.get("calendar"),
         prices_df=dfs.get("prices"),
         G=G,
-        batch_size=8,
+        batch_size=4,
         forecast_horizon=28,
         feature_window=28,
         stride=7, # stride=7 generates ~270 sliding windows
@@ -69,8 +69,10 @@ def step2_build_dataset(dfs, G=None):
 
     sample = next(iter(train_loader))
     print(f"\n[step2] Sample batch:")
-    print(f"  x shape      : {sample.x.shape}")
+    print(f"  x_seq shape  : {sample.x_seq.shape}")
+    print(f"  x_static     : {sample.x_static.shape}")
     print(f"  y shape      : {sample.y.shape}")
+    print(f"  y_hist shape : {sample.y_hist.shape}")
     print(f"  edge_index   : {sample.edge_index.shape}")
     return train_loader, val_loader, test_loader
 
@@ -86,6 +88,13 @@ def step3_train(train_loader, val_loader):
     print(f"[step3] Device: {device}")
     
     gnn_hist, base_hist = run_training(train_loader, val_loader, device)
+    
+    try:
+        from src.gnn.plot import plot_training_history
+        plot_training_history(gnn_hist, base_hist)
+    except Exception as e:
+        print(f"[step3] Plotting failed (maybe missing matplotlib?): {e}")
+        
     return gnn_hist, base_hist
 
 def step4_evaluate(test_loader, G=None):
@@ -123,7 +132,7 @@ def main():
             from src.gnn.dataset import build_dataloaders
             dfs = load_m5()
             train_loader, val_loader, test_loader = build_dataloaders(
-                dfs["sales"], G, dfs["calendar"], dfs["prices"], batch_size=8, stride=7)
+                dfs["sales"], G, dfs["calendar"], dfs["prices"], batch_size=4, stride=7)
         step3_train(train_loader, val_loader)
         
     if args.step == 0 or args.step == 4:
@@ -132,7 +141,7 @@ def main():
             from src.gnn.dataset import build_dataloaders
             dfs = load_m5()
             _, _, test_loader = build_dataloaders(
-                dfs["sales"], G, dfs["calendar"], dfs["prices"], batch_size=8, stride=7)
+                dfs["sales"], G, dfs["calendar"], dfs["prices"], batch_size=4, stride=7)
         step4_evaluate(test_loader, G)
 
     print(f"\n{'=' * 60}")

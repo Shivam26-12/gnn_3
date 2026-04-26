@@ -28,7 +28,7 @@ torch.manual_seed(42)
 FORECAST_HORIZON: int = 28
 FEATURE_WINDOW: int = 28
 STRIDE: int = 7
-BATCH_SIZE: int = 8
+BATCH_SIZE: int = 4
 TRAIN_RATIO: float = 0.70
 VAL_RATIO: float = 0.15
 
@@ -144,18 +144,28 @@ def _precompute_features(
         static_feats[i, 8] = 1.0 if str(state_ids[i]) in ("CA",) else 0.0
         static_feats[i, 9] = 1.0 if str(state_ids[i]) in ("TX",) else 0.0
 
-    # --- Price lookup ---
-    print("[dataset]   Computing price features...")
-    # Group prices by store_id and item_id and get the max (or most recent) price for normalization
-    price_map = prices_df.groupby(["store_id", "item_id"])["sell_price"].max().to_dict()
-    price_arr = np.zeros(N, dtype=np.float32)
+    # --- Price lookup & Discount Depth ---
+    print("[dataset]   Computing price matrix & discount depth...")
+    max_price_map = prices_df.groupby(["store_id", "item_id"])["sell_price"].max().to_dict()
+    max_price_arr = np.zeros(N, dtype=np.float32)
     item_ids = sales_df["item_id"].values
-    
     for i in range(N):
-        p = price_map.get((str(store_ids[i]), str(item_ids[i])), 0.0)
-        price_arr[i] = float(p)
+        p = max_price_map.get((str(store_ids[i]), str(item_ids[i])), 0.0)
+        max_price_arr[i] = float(p) + 1e-8
+
+    discount_matrix = np.ones((N, T), dtype=np.float32)
+    series_to_idx = { (str(store_ids[i]), str(item_ids[i])): i for i in range(N) }
+    
+    wk_array = calendar_df['wm_yr_wk'].values[:T]
+    wk_to_t = {}
+    for t_idx, wk in enumerate(wk_array):
+        wk_to_t.setdefault(wk, []).append(t_idx)
         
-    price_arr = price_arr / (price_arr.max() + 1e-8)
+    for row in prices_df.itertuples(index=False):
+        idx = series_to_idx.get((str(row.store_id), str(row.item_id)))
+        if idx is not None and row.wm_yr_wk in wk_to_t:
+            ts = wk_to_t[row.wm_yr_wk]
+            discount_matrix[idx, ts] = float(row.sell_price) / max_price_arr[idx]
 
     # --- SNAP matrix ---
     snap_cols = {"CA": "snap_CA", "TX": "snap_TX", "WI": "snap_WI"}
@@ -167,15 +177,43 @@ def _precompute_features(
             snap_vals = calendar_df[col].values[:T]
             snap_matrix[i, :len(snap_vals)] = snap_vals
 
+    # --- Consecutive Zeros ---
+    print("[dataset]   Computing consecutive zero sales...")
+    sf = sales_matrix.astype(np.float32)
+    is_zero = (sf == 0).astype(np.float32)
+    consec_zeros = np.zeros((N, T), dtype=np.float32)
+    for t_idx in range(1, T):
+        consec_zeros[:, t_idx] = (consec_zeros[:, t_idx-1] + 1) * is_zero[:, t_idx]
+
+    # --- Event Countdowns & Encodings ---
+    print("[dataset]   Computing event countdowns and categorical flags...")
+    days_until_event = np.zeros(T, dtype=np.float32)
+    is_sporting = np.zeros(T, dtype=np.float32)
+    is_cultural = np.zeros(T, dtype=np.float32)
+    is_national = np.zeros(T, dtype=np.float32)
+    is_religious = np.zeros(T, dtype=np.float32)
+    
+    last_event_t = 9999
+    for t_idx in range(T-1, -1, -1):
+        evt_type = calendar_df.iloc[t_idx].get("event_type_1")
+        if pd.notna(evt_type):
+            last_event_t = t_idx
+            if evt_type == "Sporting": is_sporting[t_idx] = 1.0
+            elif evt_type == "Cultural": is_cultural[t_idx] = 1.0
+            elif evt_type == "National": is_national[t_idx] = 1.0
+            elif evt_type == "Religious": is_religious[t_idx] = 1.0
+        days_until_event[t_idx] = max(0, last_event_t - t_idx)
+        
+    days_until_event = days_until_event / (days_until_event.max() + 1e-8)
+    day_of_month = pd.to_datetime(calendar_df["date"]).dt.day.values[:T] / 31.0
+
     # --- Rolling features (vectorized) ---
     print("[dataset]   Computing rolling features...")
-    sf = sales_matrix.astype(np.float32)
-
-    # Cumulative sums for efficient rolling computation
     cumsum = np.cumsum(np.pad(sf, ((0,0),(1,0))), axis=1)
     cumsq = np.cumsum(np.pad(sf**2, ((0,0),(1,0))), axis=1)
 
-    rolling_feats = np.zeros((N, T, 15), dtype=np.float32)
+    # Expanded to 21 channels for advanced STGNN features
+    rolling_feats = np.zeros((N, T, 21), dtype=np.float32)
 
     for t in range(FEATURE_WINDOW, T):
         # Lags
@@ -199,20 +237,30 @@ def _precompute_features(
         if t >= 28:
             rolling_feats[:, t, 10] = (sf[:, t-28:t] == 0).mean(axis=1)
 
-        # Price (static per series)
-        rolling_feats[:, t, 11] = price_arr
+        # 11: Discount Depth
+        rolling_feats[:, t, 11] = discount_matrix[:, t]
 
-        # SNAP
+        # 12: SNAP
         rolling_feats[:, t, 12] = snap_matrix[:, t]
 
-        # Event flag
-        has_event = 1.0 if (t < len(calendar_df) and
-                           pd.notna(calendar_df.iloc[t].get("event_name_1"))) else 0.0
-        rolling_feats[:, t, 13] = has_event
+        # 13: Days Until Event
+        rolling_feats[:, t, 13] = days_until_event[t]
 
-        # Day of week (normalized)
+        # 14: Day of Month
+        rolling_feats[:, t, 14] = day_of_month[t]
+
+        # 15: Consecutive Zeros
+        rolling_feats[:, t, 15] = consec_zeros[:, t]
+
+        # 16-19: Event Types
+        rolling_feats[:, t, 16] = is_sporting[t]
+        rolling_feats[:, t, 17] = is_cultural[t]
+        rolling_feats[:, t, 18] = is_national[t]
+        rolling_feats[:, t, 19] = is_religious[t]
+
+        # 20: Day of week (normalized)
         if t < len(calendar_df):
-            rolling_feats[:, t, 14] = calendar_df.iloc[t]["wday"] / 7.0
+            rolling_feats[:, t, 20] = calendar_df.iloc[t]["wday"] / 7.0
 
     print("[dataset]   Feature pre-computation complete.")
     return rolling_feats, static_feats, snap_matrix
@@ -251,12 +299,22 @@ def build_dataloaders(
         sales_matrix, prices_df, calendar_df, sales_df
     )
 
-    # Generate windows
-    windows = []
+    # Generate exact M5 splits based on the competition timeline
+    # M5 Evaluation Test set (d_1914 to d_1941): Target starts at T - 28
+    test_pos = T - forecast_horizon
+    # Validation set (d_1886 to d_1913): Target starts at T - 56
+    val_pos = T - 2 * forecast_horizon
+    
+    train_windows = []
     pos = feature_window
-    while pos + forecast_horizon <= T:
-        windows.append(pos)
+    # Train windows end strictly before the validation target starts
+    while pos + forecast_horizon <= val_pos:
+        train_windows.append(pos)
         pos += stride
+
+    val_windows = [val_pos]
+    test_windows = [test_pos]
+    windows = train_windows + val_windows + test_windows
 
     n_windows = len(windows)
     n_features = rolling_feats.shape[2] + static_feats.shape[1]  # 15 + 10 = 25
@@ -267,40 +325,62 @@ def build_dataloaders(
     for wi, t in enumerate(windows):
         if wi % 50 == 0:
             print(f"[dataset]   Building window {wi}/{n_windows}...")
-        x_rolling = rolling_feats[:, t, :]  # (N, 15)
-        x_static = static_feats             # (N, 10)
-        x = np.concatenate([x_rolling, x_static], axis=1)  # (N, 25)
-        y = sales_matrix[:, t:t + forecast_horizon]         # (N, 28)
+        # Extract sequences for the STGNN
+        x_seq = rolling_feats[:, t - feature_window:t, :]  # (N, seq_len, 15)
+        x_static = static_feats                            # (N, 10)
+        y = sales_matrix[:, t:t + forecast_horizon]        # (N, 28)
+        y_hist = sales_matrix[:, t - feature_window:t]     # (N, seq_len)
 
         all_data.append(Data(
-            x=torch.from_numpy(x.copy()),
+            x_seq=torch.from_numpy(x_seq.copy()),
+            x_static=torch.from_numpy(x_static.copy()),
             edge_index=edge_index,
             edge_attr=edge_attr,
             y=torch.from_numpy(y.copy()),
+            y_hist=torch.from_numpy(y_hist.copy()),
         ))
 
-    # Time-based split
-    n_train = int(n_windows * train_ratio)
-    n_val = int(n_windows * val_ratio)
+    # Exact M5 split
+    n_train = len(train_windows)
+    n_val = len(val_windows)
     train_data = all_data[:n_train]
     val_data = all_data[n_train:n_train + n_val]
     test_data = all_data[n_train + n_val:]
 
-    print(f"[dataset] Split: train={len(train_data)}, val={len(val_data)}, test={len(test_data)}")
+    print(f"[dataset] Split: train={len(train_data)} windows, val={len(val_data)} (d_{val_pos+1}-d_{test_pos}), test={len(test_data)} (d_{test_pos+1}-d_{T})")
 
     # Normalize features (fit on train only)
-    train_x = torch.cat([d.x for d in train_data], dim=0).numpy()
-    scaler = StandardScaler()
-    scaler.fit(train_x)
-    scaler.scale_ = np.where(scaler.scale_ == 0, 1.0, scaler.scale_)
+    # We fit separate scalers for sequence and static features
+    train_x_seq = torch.cat([d.x_seq for d in train_data], dim=0).numpy() # (N_train_windows * N, seq_len, 15)
+    train_x_static = torch.cat([d.x_static for d in train_data], dim=0).numpy() # (N_train_windows * N, 10)
+    
+    # Flatten sequence for scaler
+    flat_train_x_seq = train_x_seq.reshape(-1, train_x_seq.shape[-1])
+    
+    scaler_seq = StandardScaler()
+    scaler_seq.fit(flat_train_x_seq)
+    scaler_seq.scale_ = np.where(scaler_seq.scale_ == 0, 1.0, scaler_seq.scale_)
+    
+    scaler_static = StandardScaler()
+    scaler_static.fit(train_x_static)
+    scaler_static.scale_ = np.where(scaler_static.scale_ == 0, 1.0, scaler_static.scale_)
 
     for d in all_data:
-        d.x = torch.from_numpy(scaler.transform(d.x.numpy()).astype(np.float32))
+        # Scale sequence
+        shape = d.x_seq.shape
+        flat_seq = d.x_seq.numpy().reshape(-1, shape[-1])
+        scaled_seq = scaler_seq.transform(flat_seq).reshape(shape)
+        d.x_seq = torch.from_numpy(scaled_seq.astype(np.float32))
+        
+        # Scale static
+        scaled_static = scaler_static.transform(d.x_static.numpy())
+        d.x_static = torch.from_numpy(scaled_static.astype(np.float32))
 
-    # Save scaler
+    # Save scalers
+    scalers = {'seq': scaler_seq, 'static': scaler_static}
     Path("data/processed").mkdir(parents=True, exist_ok=True)
     with open("data/processed/scaler.pkl", "wb") as f:
-        pickle.dump(scaler, f)
+        pickle.dump(scalers, f)
 
     train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=False)
     val_loader = DataLoader(val_data, batch_size=batch_size, shuffle=False)

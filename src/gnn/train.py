@@ -83,12 +83,12 @@ def _train_epoch(model: nn.Module, loader: DataLoader, optimizer: torch.optim.Op
         
         if USE_BFLOAT16 and device.type == "cuda":
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                preds = model(batch.x, batch.edge_index, ea)
-                # For training loss, combining MSE and RMSSE proxy (if history available, else just MSE)
-                loss = criterion(preds, batch.y)
+                preds = model(batch.x_seq, batch.x_static, batch.edge_index, ea)
+                # Training loss using differentiable RMSSE proxy with historical sales
+                loss = criterion(preds, batch.y, y_hist=getattr(batch, 'y_hist', None))
         else:
-            preds = model(batch.x, batch.edge_index, ea)
-            loss = criterion(preds, batch.y)
+            preds = model(batch.x_seq, batch.x_static, batch.edge_index, ea)
+            loss = criterion(preds, batch.y, y_hist=getattr(batch, 'y_hist', None))
             
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -114,7 +114,7 @@ def _evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Dic
     for batch in loader:
         batch = batch.to(device)
         ea = getattr(batch, "edge_attr", None)
-        preds = model(batch.x, batch.edge_index, ea)
+        preds = model(batch.x_seq, batch.x_static, batch.edge_index, ea)
         all_preds.append(preds.cpu())
         all_targets.append(batch.y.cpu())
         
@@ -134,7 +134,7 @@ def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoad
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=20, T_mult=2)
-    criterion = nn.MSELoss() # Fallback to MSE for stable training, evaluate via WRMSSE
+    criterion = RMSSELoss() # Use differentiable WRMSSE proxy
     
     history = {"train_loss": [], "val_loss": [], "val_wrmsse": [], "best_epoch": 0, "best_wrmsse": float('inf')}
     patience_cnt = 0
@@ -170,15 +170,16 @@ def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoad
 
 def run_training(train_loader: DataLoader, val_loader: DataLoader, device: torch.device) -> Tuple[Dict, Dict]:
     sample = next(iter(train_loader))
-    in_channels = sample.x.shape[1]
+    seq_channels = sample.x_seq.shape[2]
+    static_channels = sample.x_static.shape[1]
     horizon = sample.y.shape[1]
     
     from src.gnn.model import DTNetGNN, IsolatedBaseline
     
-    gnn = DTNetGNN(in_channels=in_channels, forecast_horizon=horizon)
+    gnn = DTNetGNN(seq_channels=seq_channels, static_channels=static_channels, forecast_horizon=horizon)
     gnn_hist = train_model(gnn, train_loader, val_loader, GNN_SAVE_PATH, device, "DTNetGNN")
     
-    baseline = IsolatedBaseline(in_channels=in_channels, forecast_horizon=horizon)
+    baseline = IsolatedBaseline(seq_channels=seq_channels, static_channels=static_channels, forecast_horizon=horizon)
     base_hist = train_model(baseline, train_loader, val_loader, BASELINE_SAVE_PATH, device, "Baseline")
     
     return gnn_hist, base_hist
